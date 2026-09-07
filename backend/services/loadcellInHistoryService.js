@@ -68,21 +68,25 @@ export const getLoadcellInHistory = async ({ from, to, limit } = {}) => {
     : new Date(toDate.getTime() - 60 * 60 * 1000)
 
   const result = await queryPostgres(
-    `SELECT
-       id,
-       process_id,
-       machine_code,
-       value_kg,
-       input_maximum_kg,
-       input_total_kg,
-       status,
-       source,
-       recorded_at,
-       received_at
-     FROM loadcell_in.measurements
-     WHERE recorded_at >= $1 AND recorded_at <= $2
-     ORDER BY recorded_at ASC
-     LIMIT $3`,
+    `SELECT *
+     FROM (
+       SELECT
+         id,
+         process_id,
+         machine_code,
+         value_kg,
+         input_maximum_kg,
+         input_total_kg,
+         status,
+         source,
+         recorded_at,
+         received_at
+       FROM loadcell_in.measurements
+       WHERE recorded_at >= $1 AND recorded_at <= $2
+       ORDER BY recorded_at DESC
+       LIMIT $3
+     ) recent
+     ORDER BY recorded_at ASC`,
     [fromDate, toDate, safeLimit]
   )
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import PropTypes from 'prop-types'
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { Activity, ArrowRight, Boxes, ImageIcon, Magnet, Plus, Scale, Settings, Sparkles, Trash2, Zap } from 'lucide-react'
+import { Activity, ArrowRight, Boxes, ImageIcon, Magnet, Plus, RefreshCw, Scale, Settings, Sparkles, Trash2, Zap } from 'lucide-react'
 import MachineControlModal from '../components/MachineControlModal'
 import useNodeRedDashboard from '../hooks/useNodeRedDashboard'
 import { api } from '../services/api.js'
@@ -28,9 +28,16 @@ const EMPTY_LIVE_PACKAGING = []
 const NODE_RED_DASHBOARD_POLL_MS = 5000
 const LOADCELL_REALTIME_POLL_MS = 1000
 const LOADCELL_HISTORY_POINTS = 90
+const LOADCELL_HISTORY_REFRESH_MS = 30000
 const NODE_RED_LIVE_SOURCE = 'node-red'
 const DEFAULT_MACHINE_STOP_STATUS = 'STOP'
 const DEFAULT_PACKAGING_STOP_STATUS = 'DISCONNECT'
+
+const loadcellHistoryRangeOptions = [
+  { key: '1h', label: '1h', minutes: 60, limit: 900 },
+  { key: '6h', label: '6h', minutes: 360, limit: 3000 },
+  { key: '24h', label: '24h', minutes: 1440, limit: 5000 },
+]
 
 const loadcellChartConfigs = {
   2: {
@@ -989,6 +996,41 @@ function makeLoadcellSample(at = new Date(), reading = null) {
   }
 }
 
+function readLoadcellHistoryValue(record = {}, camelKey, snakeKey, fallback = null) {
+  return powerNumber(record[camelKey] ?? record[snakeKey], fallback)
+}
+
+function makeLoadcellHistorySample(record = {}) {
+  const value = readLoadcellHistoryValue(record, 'valueKg', 'value_kg', null)
+  if (value === null) return null
+
+  const at = parseSampleTime(record.recordedAt || record.recorded_at || record.receivedAt || record.received_at)
+  return {
+    sampledAt: at.getTime(),
+    time: formatLoadcellSampleTime(at),
+    weight: Math.round(value * 100) / 100,
+    status: record.status || 'OFF',
+  }
+}
+
+function isLoadcellRunningStatus(status) {
+  return ['ON', 'ONLINE', 'RUN', 'RUNNING', 'TRUE'].includes(String(status || '').trim().toUpperCase())
+}
+
+function makeLoadcellHistoryReading(record = null) {
+  if (!record) return null
+  const current = readLoadcellHistoryValue(record, 'valueKg', 'value_kg', null)
+  if (current === null) return null
+
+  return {
+    current,
+    maximum: readLoadcellHistoryValue(record, 'inputMaximumKg', 'input_maximum_kg', 0),
+    total: readLoadcellHistoryValue(record, 'inputTotalKg', 'input_total_kg', 0),
+    status: record.status || 'OFF',
+    isOnline: isLoadcellRunningStatus(record.status),
+  }
+}
+
 function appendLoadcellSample(series = [], sample = null) {
   if (!sample) return series
   const last = series.at(-1)
@@ -1005,7 +1047,7 @@ function getLoadcellStats(series = [], reading = null) {
   const seriesTotal = series.reduce((sum, point) => sum + point.weight, 0)
   const current = liveCurrent ?? series.at(-1)?.weight ?? 0
   const maximum = liveMaximum ?? series.reduce((max, point) => Math.max(max, point.weight), 0)
-  const minimum = series.reduce((min, point) => Math.min(min, point.weight), 100)
+  const minimum = series.length ? series.reduce((min, point) => Math.min(min, point.weight), series[0].weight) : 0
   const total = liveTotal ?? seriesTotal
   const average = series.length ? seriesTotal / series.length : 0
   return { current, maximum, minimum, total, average }
@@ -1688,18 +1730,41 @@ MachineContainerCard.propTypes = {
 
 function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = null, sampledAt = null, runtime = ZERO_RUNTIME }) {
   const sampleTime = useMemo(() => parseSampleTime(sampledAt, now), [sampledAt, now])
+  const supportsHistory = config.id === 'loadcell-in'
+  const [chartMode, setChartMode] = useState('live')
+  const [historyRange, setHistoryRange] = useState(loadcellHistoryRangeOptions[0].key)
+  const [historyRecords, setHistoryRecords] = useState([])
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState(null)
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0)
   const [series, setSeries] = useState(() => {
     const sample = makeLoadcellSample(sampleTime, reading)
     return sample ? [sample] : []
   })
-  const stats = useMemo(() => getLoadcellStats(series, reading), [series, reading])
-  const loadcellRuntime = useMemo(() => getLoadcellRuntime(reading, runtime), [reading, runtime])
-  const chartMax = useMemo(() => getLoadcellChartMax(series, stats, config.chartMax), [series, stats, config.chartMax])
-  const nodeRedMaximum = powerNumber(reading?.maximum, 0)
-  const nodeRedTotal = powerNumber(reading?.total, 0)
+  const selectedHistoryRange = useMemo(
+    () => loadcellHistoryRangeOptions.find((option) => option.key === historyRange) || loadcellHistoryRangeOptions[0],
+    [historyRange]
+  )
+  const isHistoryMode = supportsHistory && chartMode === 'history'
+  const historySeries = useMemo(
+    () => historyRecords.map(makeLoadcellHistorySample).filter(Boolean),
+    [historyRecords]
+  )
+  const latestHistoryRecord = historyRecords.at(-1) || null
+  const historyReading = useMemo(() => makeLoadcellHistoryReading(latestHistoryRecord), [latestHistoryRecord])
+  const displaySeries = isHistoryMode ? historySeries : series
+  const displayReading = isHistoryMode ? historyReading : reading
+  const displaySampleTime = displaySeries.at(-1)?.sampledAt
+    ? new Date(displaySeries.at(-1).sampledAt)
+    : sampleTime
+  const stats = useMemo(() => getLoadcellStats(displaySeries, displayReading), [displaySeries, displayReading])
+  const loadcellRuntime = useMemo(() => getLoadcellRuntime(isHistoryMode ? null : reading, runtime), [isHistoryMode, reading, runtime])
+  const chartMax = useMemo(() => getLoadcellChartMax(displaySeries, stats, config.chartMax), [displaySeries, stats, config.chartMax])
+  const displayMaximum = powerNumber(displayReading?.maximum, 0)
+  const displayTotal = powerNumber(displayReading?.total, 0)
   const fillPercent = chartMax > 0 ? loadcellClamp((stats.current / chartMax) * 100) : 0
-  const maximumPercent = chartMax > 0 ? loadcellClamp((nodeRedMaximum / chartMax) * 100) : 0
-  const totalPercent = nodeRedTotal > 0 ? 100 : 0
+  const maximumPercent = chartMax > 0 ? loadcellClamp((displayMaximum / chartMax) * 100) : 0
+  const totalPercent = displayTotal > 0 ? 100 : 0
   const totalRuntimeMinutes = loadcellRuntime.workingTimeMinutes + loadcellRuntime.stopTimeMinutes
   const workingPercent = totalRuntimeMinutes > 0
     ? loadcellClamp((loadcellRuntime.workingTimeMinutes / totalRuntimeMinutes) * 100)
@@ -1744,26 +1809,30 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
     },
   }
   const tone = toneStyles[config.tone] || toneStyles.emerald
-  const lastUpdatedLabel = sampleTime.toLocaleTimeString('th-TH', {
+  const lastUpdatedLabel = displaySampleTime.toLocaleTimeString('th-TH', {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
     hour12: false,
   })
-  const signalStatus = isOn
+  const displaySignalOn = isHistoryMode ? isLoadcellRunningStatus(displayReading?.status) : isOn
+  const signalStatus = displaySignalOn
     ? {
-        label: 'ON',
+        label: isHistoryMode ? 'RUNNING' : 'ON',
         badge: 'border-emerald-400/40 bg-emerald-500/15 text-emerald-200',
         dot: 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.9)]',
       }
     : {
-        label: 'OFF',
+        label: isHistoryMode ? String(displayReading?.status || 'NO DATA').toUpperCase() : 'OFF',
         badge: 'border-red-400/40 bg-red-500/15 text-red-200',
         dot: 'bg-red-400 shadow-[0_0_10px_rgba(248,113,113,0.9)]',
       }
 
   useEffect(() => {
     setSeries([])
+    setChartMode('live')
+    setHistoryRecords([])
+    setHistoryError(null)
   }, [config.id])
 
   useEffect(() => {
@@ -1771,6 +1840,39 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
     if (!sample) return
     setSeries((current) => appendLoadcellSample(current, sample))
   }, [reading, sampleTime])
+
+  useEffect(() => {
+    if (!isHistoryMode) return undefined
+
+    let cancelled = false
+    const loadHistory = async () => {
+      setHistoryLoading(true)
+      setHistoryError(null)
+      const to = new Date()
+      const from = new Date(to.getTime() - selectedHistoryRange.minutes * 60 * 1000)
+
+      try {
+        const res = await api.getLoadcellInHistory({
+          from: from.toISOString(),
+          to: to.toISOString(),
+          limit: selectedHistoryRange.limit,
+        })
+        const records = Array.isArray(res.data) ? res.data : []
+        if (!cancelled) setHistoryRecords(records)
+      } catch (err) {
+        if (!cancelled) setHistoryError(err)
+      } finally {
+        if (!cancelled) setHistoryLoading(false)
+      }
+    }
+
+    loadHistory()
+    const timer = setInterval(loadHistory, LOADCELL_HISTORY_REFRESH_MS)
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [historyRefreshKey, isHistoryMode, selectedHistoryRange])
 
   return (
     <section className={`flex flex-col overflow-hidden rounded-xl border ${processTheme.borderStrong} bg-bg-card/90 panel ring-1 ${processTheme.ring} xl:min-h-[calc(100dvh-220px)]`}>
@@ -1786,6 +1888,45 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            {supportsHistory && (
+              <div className="flex items-center rounded-lg border border-border bg-bg-card/60 p-0.5">
+                {['live', 'history'].map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => setChartMode(mode)}
+                    className={`min-w-16 rounded-md px-3 py-1 text-[10px] font-black uppercase transition ${chartMode === mode ? `${tone.bg} ${tone.value}` : 'text-slate-500 hover:text-slate-200'}`}
+                  >
+                    {mode}
+                  </button>
+                ))}
+              </div>
+            )}
+            {isHistoryMode && (
+              <div className="flex items-center rounded-lg border border-border bg-bg-card/60 p-0.5">
+                {loadcellHistoryRangeOptions.map((option) => (
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() => setHistoryRange(option.key)}
+                    className={`rounded-md px-2.5 py-1 font-mono text-[10px] font-black transition ${historyRange === option.key ? `${tone.bg} ${tone.value}` : 'text-slate-500 hover:text-slate-200'}`}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            {isHistoryMode && (
+              <button
+                type="button"
+                onClick={() => setHistoryRefreshKey((value) => value + 1)}
+                className={`flex h-7 w-7 items-center justify-center rounded-lg border ${tone.border} ${tone.bgSoft} ${tone.value} transition hover:bg-white/10`}
+                title="Refresh history"
+                aria-label="Refresh history"
+              >
+                <RefreshCw size={13} strokeWidth={2.4} className={historyLoading ? 'animate-spin' : ''} />
+              </button>
+            )}
             <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[10px] font-black uppercase ${signalStatus.badge}`}>
               <span className={`h-2 w-2 rounded-full ${signalStatus.dot}`} />
               {signalStatus.label}
@@ -1822,7 +1963,7 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
             </div>
             <div className="min-h-0 flex-1">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={series} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}>
+                <AreaChart data={displaySeries} margin={{ top: 12, right: 12, left: -18, bottom: 0 }}>
                   <defs>
                     <linearGradient id={`${config.id}-fill`} x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor={config.fillColor} stopOpacity={0.34} />
@@ -1870,11 +2011,20 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
                     strokeWidth={2.5}
                     fill={`url(#${config.id}-fill)`}
                     filter={`url(#${config.id}-glow)`}
-                    dot={series.length < 2 ? { r: 3, stroke: config.lineColor, strokeWidth: 2, fill: '#020617' } : false}
+                    dot={displaySeries.length < 2 ? { r: 3, stroke: config.lineColor, strokeWidth: 2, fill: '#020617' } : false}
                     activeDot={{ r: 4, stroke: config.lineColor, strokeWidth: 2, fill: '#020617' }}
                   />
                 </AreaChart>
               </ResponsiveContainer>
+              {isHistoryMode && (historyLoading || historyError || displaySeries.length === 0) && (
+                <div className="pointer-events-none absolute inset-x-4 top-1/2 z-10 -translate-y-1/2 rounded-lg border border-border bg-bg-card/85 px-4 py-3 text-center text-xs font-bold text-slate-300 shadow-[0_18px_50px_rgba(0,0,0,0.35)]">
+                  {historyLoading && displaySeries.length === 0
+                    ? 'กำลังโหลดข้อมูลย้อนหลัง...'
+                    : historyError
+                      ? 'โหลดข้อมูลย้อนหลังไม่ได้'
+                      : 'ยังไม่มีข้อมูลย้อนหลังในช่วงนี้'}
+                </div>
+              )}
             </div>
           </div>
 
@@ -1882,7 +2032,7 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
             <div className="h-[128px] overflow-hidden rounded-lg border border-violet-400/35 bg-violet-400/10 p-3">
               <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">{config.maximumLabel}</div>
               <div className="mt-2 font-mono text-3xl font-black text-violet-300">
-                {formatLoadcellValue(nodeRedMaximum)}
+                {formatLoadcellValue(displayMaximum)}
                 <span className="ml-2 text-sm text-slate-300">kg</span>
               </div>
               <div className="mt-3 h-1 overflow-hidden rounded-full bg-slate-700/50">
@@ -1892,7 +2042,7 @@ function LoadcellTrendPanel({ config, now, processTheme, isOn = true, reading = 
             <div className="h-[128px] overflow-hidden rounded-lg border border-red-400/35 bg-red-400/10 p-3">
               <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">{config.totalLabel}</div>
               <div className="mt-2 font-mono text-3xl font-black text-red-300">
-                {formatLoadcellValue(nodeRedTotal, 1)}
+                {formatLoadcellValue(displayTotal, 1)}
                 <span className="ml-2 text-sm text-slate-300">kg</span>
               </div>
               <div className="mt-3 h-1 overflow-hidden rounded-full bg-slate-700/50">
